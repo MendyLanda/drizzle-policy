@@ -1,0 +1,179 @@
+{
+  "name": "drizzle-policy",
+  "version": "0.1.0",
+  "packageManager": "bun@1.3.5",
+  "description": "Application-side policy enforcement for Drizzle ORM.",
+  "type": "module",
+  "main": "./lib/cjs/index.js",
+  "module": "./lib/esm/index.js",
+  "types": "./lib/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/esm/index.d.ts",
+      "import": "./lib/esm/index.js",
+      "require": "./lib/cjs/index.js",
+      "default": "./lib/esm/index.js"
+    },
+    "./v0": {
+      "types": "./lib/esm/v0/index.d.ts",
+      "import": "./lib/esm/v0/index.js",
+      "require": "./lib/cjs/v0/index.js",
+      "default": "./lib/esm/v0/index.js"
+    },
+    "./recipes/soft-delete": {
+      "types": "./lib/esm/recipes/soft-delete-policy.d.ts",
+      "import": "./lib/esm/recipes/soft-delete-policy.js",
+      "require": "./lib/cjs/recipes/soft-delete-policy.js",
+      "default": "./lib/esm/recipes/soft-delete-policy.js"
+    },
+    "./recipes/scope-isolation": {
+      "types": "./lib/esm/recipes/scope-isolation-policy.d.ts",
+      "import": "./lib/esm/recipes/scope-isolation-policy.js",
+      "require": "./lib/cjs/recipes/scope-isolation-policy.js",
+      "default": "./lib/esm/recipes/scope-isolation-policy.js"
+    }
+  },
+  "files": [
+    "lib/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "bun run clean && bun run build:esm && bun run build:cjs && node scripts/write-cjs-package.cjs",
+    "build:cjs": "tsc --project tsconfig.cjs.json",
+    "build:esm": "tsc --project tsconfig.esm.json",
+    "clean": "rm -rf ./lib/",
+    "cm": "cz",
+    "example:client": "bun examples/policy-client.ts",
+    "example:v0:minimal": "bun examples/v0-policy-client-minimal.ts",
+    "format": "oxfmt . --write",
+    "format:check": "oxfmt . --check",
+    "lint": "oxlint src test examples --ignore-pattern '**/* copy.ts' --ignore-pattern '**/* copy.tsx' --deny-warnings",
+    "lint:fix": "oxlint src test examples --ignore-pattern '**/* copy.ts' --ignore-pattern '**/* copy.tsx' --fix",
+    "prepare": "husky",
+    "semantic-release": "semantic-release",
+    "test:watch": "bun test --watch",
+    "test": "bun test --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MendyLanda/drizzle-policy.git"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Mendy Landa",
+    "email": "landamendy@gmail.com",
+    "url": "https://github.com/MendyLanda"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "drizzle",
+    "drizzle-orm",
+    "policy",
+    "policies",
+    "multi-tenant",
+    "tenancy",
+    "scope-isolation",
+    "data-isolation",
+    "row-level-security",
+    "rls",
+    "soft-delete",
+    "typescript",
+    "bun"
+  ],
+  "bugs": {
+    "url": "https://github.com/MendyLanda/drizzle-policy/issues"
+  },
+  "homepage": "https://github.com/MendyLanda/drizzle-policy#readme",
+  "peerDependencies": {
+    "drizzle-orm": ">=0.45.0 <2"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.3",
+    "@types/bun": "^1.3.14",
+    "@types/node": "^26.0.0",
+    "@types/pg": "^8.20.0",
+    "commitizen": "^4.3.2",
+    "conventional-changelog-conventionalcommits": "^9.3.1",
+    "cz-conventional-changelog": "^3.3.0",
+    "drizzle-orm": "^1.0.0-rc.3",
+    "drizzle-orm-v0": "^0.45.2",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.8",
+    "oxfmt": "^0.55.0",
+    "oxlint": "^1.70.0",
+    "pg": "^8.22.0",
+    "semantic-release": "^25.0.5",
+    "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "brace-expansion": "1.1.15",
+    "braces": "3.0.3",
+    "cross-spawn": "7.0.6",
+    "diff": "4.0.4",
+    "js-yaml": "5.0.0",
+    "lodash-es": "4.18.1",
+    "micromatch": "4.0.8",
+    "minimatch": "3.1.5",
+    "picomatch": "2.3.2",
+    "semver": "6.3.1"
+  },
+  "config": {
+    "commitizen": {
+      "path": "./node_modules/cz-conventional-changelog"
+    }
+  },
+  "lint-staged": {
+    "*.{js,jsx,ts,tsx,json,jsonc}": "oxfmt --write",
+    "*.{js,jsx,ts,tsx}": "oxlint --fix"
+  },
+  "release": {
+    "branches": [
+      "main"
+    ],
+    "plugins": [
+      [
+        "@semantic-release/commit-analyzer",
+        {
+          "preset": "conventionalcommits",
+          "releaseRules": [
+            {
+              "type": "build",
+              "scope": "deps",
+              "release": "patch"
+            }
+          ]
+        }
+      ],
+      [
+        "@semantic-release/release-notes-generator",
+        {
+          "preset": "conventionalcommits",
+          "presetConfig": {
+            "types": [
+              {
+                "type": "feat",
+                "section": "Features"
+              },
+              {
+                "type": "fix",
+                "section": "Bug Fixes"
+              },
+              {
+                "type": "build",
+                "section": "Dependencies and Other Build Updates",
+                "hidden": false
+              }
+            ]
+          }
+        }
+      ],
+      "@semantic-release/npm",
+      "@semantic-release/github"
+    ]
+  }
+}
