@@ -125,20 +125,38 @@ const wrapReadQuery = <TContext, TSchema extends MaybeSchema>(
   tables: TableRegistry<TSchema>,
   table: ResolvedTable<TSchema>
 ): object => {
+  const sourceIsProtected = tables.isProtectedSource(table.table);
+
   return wrapWhereQuery(
     query,
     () => {
-      return evaluateReadPolicies(runtime, table).predicates;
+      return sourceIsProtected
+        ? []
+        : evaluateReadPolicies(runtime, table).predicates;
     },
     {
       interceptCall(prop, target, args) {
+        if (prop === 'as') {
+          const result = callMethod(target, prop, args);
+          if (!isObject(result)) {
+            throw new Error(
+              'Expected Drizzle select.as() to return an object.'
+            );
+          }
+
+          tables.markProtectedSource(result);
+          return { handled: true, result };
+        }
+
         if (!isJoinMethod(prop)) {
           return undefined;
         }
 
         const [joinTable, joinOn, ...rest] = args;
-        const plan = evaluateReadPolicies(runtime, tables.resolve(joinTable));
-        const nextJoinOn = combinePredicates(...plan.predicates, joinOn);
+        const predicates = tables.isProtectedSource(joinTable)
+          ? []
+          : evaluateReadPolicies(runtime, tables.resolve(joinTable)).predicates;
+        const nextJoinOn = combinePredicates(...predicates, joinOn);
 
         return {
           handled: true,
@@ -238,6 +256,7 @@ const shouldApplyBefore = (prop: string | symbol): boolean => {
     prop === 'then' ||
     prop === 'catch' ||
     prop === 'finally' ||
+    prop === 'as' ||
     prop === 'prepare' ||
     prop === '_prepare'
   );

@@ -309,6 +309,39 @@ describe('v0 proxy enforcement', () => {
     expect(query.params).toEqual(['tenant_1', 'tenant_1']);
   });
 
+  test('keeps read policies when v0 select builders become subqueries', () => {
+    const db = createScopedV0Db();
+    const subquery = db.select().from(schema.projects).as('scoped_projects');
+
+    const query = db.select().from(subquery).toSQL();
+
+    expect(query.sql).toContain('"projects"."tenant_id" = $1');
+    expect(query.sql).toContain('"projects"."deleted_at" is null');
+    expect(query.params).toEqual(['tenant_1']);
+  });
+
+  test('accepts policy-created v0 subqueries in strict mode', () => {
+    const db = createScopedV0Db({ onNoPolicyMatched: 'throw' });
+    const subquery = db.select().from(schema.projects).as('scoped_projects');
+
+    const query = db.select().from(subquery).toSQL();
+
+    expect(query.sql).toContain('"projects"."tenant_id" = $1');
+    expect(query.sql).toContain('"projects"."deleted_at" is null');
+    expect(query.params).toEqual(['tenant_1']);
+  });
+
+  test('rejects raw v0 subqueries by alias in strict mode', () => {
+    const { db, rawDb } = createScopedV0Environment({
+      onNoPolicyMatched: 'throw',
+    });
+    const subquery = rawDb.select().from(schema.projects).as('raw_projects');
+
+    expect(() => db.select().from(subquery).toSQL()).toThrow(
+      'No policy matched read on "raw_projects".'
+    );
+  });
+
   test('wraps v0 transaction clients with the same policies', async () => {
     const { db } = createScopedV0Environment();
 

@@ -453,7 +453,11 @@ const emitClientCall = (
  * policy predicates after `.from(...)`.
  */
 const isSelectMethod = (prop: string | symbol): boolean => {
-  return prop === 'select' || prop === 'selectDistinct';
+  return (
+    prop === 'select' ||
+    prop === 'selectDistinct' ||
+    prop === 'selectDistinctOn'
+  );
 };
 
 /**
