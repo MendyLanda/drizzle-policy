@@ -46,11 +46,15 @@ export interface TableRegistry<TSchema extends MaybeSchema = MaybeSchema> {
    * Records a derived query source whose underlying reads were checked by this
    * policy client.
    */
-  markProtectedSource(source: object): void;
+  markProtectedSource(source: object, rebuild?: () => object): void;
   /**
    * Returns whether a derived query source was checked by this policy client.
    */
   isProtectedSource(source: unknown): boolean;
+  /**
+   * Rebuilds a protected derived source for the active policy state.
+   */
+  rebuildProtectedSource(source: unknown): object | undefined;
 }
 
 /**
@@ -67,6 +71,7 @@ export const createTableRegistry = <TSchema extends MaybeSchema>(
   const tablesByName = new Map<string, ResolvedTable<TSchema>>();
   const tablesByValue = new WeakMap<object, ResolvedTable<TSchema>>();
   const protectedSources = new WeakSet<object>();
+  const protectedSourceRebuilders = new WeakMap<object, () => object>();
 
   if (queryRoot) {
     for (const [tableKey, builder] of Object.entries(queryRoot)) {
@@ -123,8 +128,11 @@ export const createTableRegistry = <TSchema extends MaybeSchema>(
         table: table as SchemaTable<TSchema>,
       };
     },
-    markProtectedSource(source) {
+    markProtectedSource(source, rebuild) {
       protectedSources.add(source);
+      if (rebuild) {
+        protectedSourceRebuilders.set(source, rebuild);
+      }
     },
     isProtectedSource(source) {
       return (
@@ -132,6 +140,11 @@ export const createTableRegistry = <TSchema extends MaybeSchema>(
         source !== null &&
         protectedSources.has(source)
       );
+    },
+    rebuildProtectedSource(source) {
+      return typeof source === 'object' && source !== null
+        ? protectedSourceRebuilders.get(source)?.()
+        : undefined;
     },
   };
 };
