@@ -101,7 +101,7 @@ export interface DeletePolicyPlan {
    *
    * Undefined means the original delete remains a delete.
    */
-  readonly updateSet?: Record<string, unknown>;
+  readonly updateSet?: Record<string, unknown> | undefined;
   /**
    * Whether at least one delete policy affected the operation.
    */

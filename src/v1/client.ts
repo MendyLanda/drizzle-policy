@@ -65,6 +65,12 @@ export interface CreateV1PolicyClientOptions<
    * @defaultValue `undefined`
    */
   readonly trace?: V1PolicyTraceSink;
+  /**
+   * Query error translation is currently available only from the v0 wrapper.
+   *
+   * @defaultValue `undefined`
+   */
+  readonly onQueryError?: never;
 }
 
 /**

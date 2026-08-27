@@ -21,13 +21,15 @@ export interface PolicyRuntime<TContext, TSchema extends MaybeSchema> {
    *
    * Includes the policy set and fallback decisions.
    */
-  readonly options: CreatePolicyClientOptions<TContext, TSchema>;
+  readonly options: CreatePolicyClientOptions<TContext, TSchema> & {
+    readonly onQueryError?: (error: unknown) => unknown;
+  };
   /**
    * Optional callback for policy trace events.
    *
    * @defaultValue `undefined`
    */
-  readonly trace?: V0PolicyTraceSink;
+  readonly trace?: V0PolicyTraceSink | undefined;
   /**
    * Reads the current policy context.
    *

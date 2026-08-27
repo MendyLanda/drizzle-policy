@@ -1,4 +1,5 @@
 import type { MaybeSchema } from '../core/types.js';
+import { wrapQueryErrors } from './query-errors.js';
 import { combinePredicates } from './predicate.js';
 import {
   evaluateInsertPolicies,
@@ -35,7 +36,10 @@ export const wrapSelectBuilder = <TContext, TSchema extends MaybeSchema>(
           );
         }
 
-        return wrapReadQuery(query, runtime, tables, tables.resolve(table));
+        return wrapQueryErrors(
+          wrapReadQuery(query, runtime, tables, tables.resolve(table)),
+          runtime
+        );
       };
     },
   });
@@ -62,7 +66,14 @@ export const wrapInsertBuilder = <TContext, TSchema extends MaybeSchema>(
 
       return (values: unknown, ...args: readonly unknown[]) => {
         const plan = evaluateInsertPolicies(runtime, table, values);
-        return Reflect.apply(value, target, [plan.values, ...args]);
+        const query = Reflect.apply(value, target, [plan.values, ...args]);
+        if (!isObject(query)) {
+          throw new Error(
+            'Expected Drizzle insert.values() to return an object.'
+          );
+        }
+
+        return wrapQueryErrors(query, runtime);
       };
     },
   });
@@ -95,7 +106,7 @@ export const wrapUpdateBuilder = <TContext, TSchema extends MaybeSchema>(
           throw new Error('Expected Drizzle update.set() to return an object.');
         }
 
-        return wrapWhereQuery(query, plan.predicates);
+        return wrapQueryErrors(wrapWhereQuery(query, plan.predicates), runtime);
       };
     },
   });
@@ -202,6 +213,12 @@ export const wrapWhereQuery = (
         }
 
         const result = Reflect.apply(value, target, args);
+        if (prop === 'where') {
+          // .where() assigns rather than accumulates, discarding an applied
+          // policy predicate — re-arm so it is recombined.
+          applied = false;
+        }
+
         return result === target ? proxy : result;
       };
     },

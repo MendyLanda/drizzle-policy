@@ -38,7 +38,14 @@ export type V0SqlClient = {
   select(): {
     from(table: unknown): SqlQuery & {
       innerJoin(table: unknown, on: unknown): SqlQuery;
+      where(predicate: unknown): SqlQuery;
     };
+  };
+  selectDistinct(): {
+    from(table: unknown): SqlQuery;
+  };
+  selectDistinctOn(columns: readonly unknown[]): {
+    from(table: unknown): SqlQuery;
   };
   insert(table: unknown): {
     values(values: unknown): SqlQuery;
@@ -74,6 +81,7 @@ export type ScopedV0DbOptions = {
   >;
   readonly rawExecution?: RawExecutionOption<AppPolicyContext>;
   readonly trace?: V0PolicyTraceSink;
+  readonly onQueryError?: (error: unknown) => unknown;
 };
 
 export interface ScopedV0Environment {
@@ -135,6 +143,7 @@ export const createScopedV0Environment = (
     onNoPolicyMatched: options.onNoPolicyMatched,
     rawExecution: options.rawExecution,
     trace: options.trace,
+    onQueryError: options.onQueryError,
   });
 
   return {

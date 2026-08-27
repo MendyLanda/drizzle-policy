@@ -2,6 +2,7 @@ import type { MaybeSchema, SchemaTable } from '../core/types.js';
 import { combinePredicates } from './predicate.js';
 import { evaluateReadPolicies, type PolicyRuntime } from './policy-engine.js';
 import type { ResolvedTable, TableRegistry } from './table-registry.js';
+import { wrapQueryErrors } from './query-errors.js';
 
 /**
  * Drizzle relational `where` callback shape.
@@ -79,7 +80,8 @@ const wrapRelationalTableBuilder = <TContext, TSchema extends MaybeSchema>(
           tables
         );
 
-        return Reflect.apply(value, target, [nextConfig, ...args]);
+        const query = Reflect.apply(value, target, [nextConfig, ...args]);
+        return isObject(query) ? wrapQueryErrors(query, runtime) : query;
       };
     },
   });

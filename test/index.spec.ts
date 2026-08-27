@@ -442,6 +442,14 @@ describe('drizzle-policy interface', () => {
       policies,
     });
 
+    typeCheckOnly(() =>
+      createPolicyClient(db, {
+        policies,
+        // @ts-expect-error query error translation is currently v0-only
+        onQueryError: error => error,
+      })
+    );
+
     expect(policyDb.getPolicyContext()).toBeUndefined();
 
     policyContext.run(appContext, () => {

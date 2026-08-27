@@ -390,10 +390,11 @@ export const { db, policyContext } = createPolicyClient(rawDb, {
 
 Defaults:
 
-| Option              | Default | Meaning                                                                                    |
-| ------------------- | ------- | ------------------------------------------------------------------------------------------ |
-| `onNoPolicyMatched` | `allow` | Operations that no policy handles continue unchanged.                                      |
-| `rawExecution`      | `throw` | Direct raw execution methods such as `execute` are rejected outside unsafe execute scopes. |
+| Option              | Default | Meaning                                                                                        |
+| ------------------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `onNoPolicyMatched` | `allow` | Operations that no policy handles continue unchanged.                                          |
+| `rawExecution`      | `throw` | Direct raw execution methods such as `execute` are rejected outside unsafe execute scopes.     |
+| `onQueryError`      | –       | v0 only. Translates an error raised by a wrapped execution path; the returned value is thrown. |
 
 Recipe defaults:
 

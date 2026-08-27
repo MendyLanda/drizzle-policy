@@ -15,17 +15,19 @@ import type {
   RawExecutionOption,
   UnsafePolicyInput,
 } from '../core/client.js';
-import type {
-  MaybeSchema,
-  PolicyContext,
-  PolicyNameInput,
-  PolicyNames,
-  PolicySet,
+import {
+  DrizzlePolicyError,
+  type MaybeSchema,
+  type PolicyContext,
+  type PolicyNameInput,
+  type PolicyNames,
+  type PolicySet,
 } from '../core/types.js';
 import {
   enforceRawExecution,
   evaluateDeletePolicies,
 } from './policy-engine.js';
+import { wrapQueryErrors } from './query-errors.js';
 import { wrapRelationalQueryRoot } from './relational.js';
 import { createTableRegistry } from './table-registry.js';
 import { emitTrace, type V0PolicyTraceSink } from './trace.js';
@@ -65,6 +67,13 @@ export interface CreateV0PolicyClientOptions<
    * @defaultValue `undefined`
    */
   readonly trace?: V0PolicyTraceSink;
+  /**
+   * Translates an error raised by a v0 policy-wrapped execution path; the
+   * returned value is thrown in place of the original.
+   *
+   * @defaultValue `undefined`
+   */
+  readonly onQueryError?: (error: unknown) => unknown;
 }
 
 /**
@@ -158,6 +167,26 @@ export function createPolicyClient<
 }
 
 /**
+ * Query-producing surfaces the policy client cannot enforce.
+ */
+const UNSUPPORTED_SURFACES: ReadonlySet<string> = new Set([
+  'with',
+  '$with',
+  'refreshMaterializedView',
+  '$count',
+  '$client',
+]);
+
+/**
+ * Select-style methods that resolve their table only at `.from(...)`.
+ */
+const SELECT_METHODS: ReadonlySet<string> = new Set([
+  'select',
+  'selectDistinct',
+  'selectDistinctOn',
+]);
+
+/**
  * Creates the protected Drizzle client used by public bundles and nested scopes.
  *
  * This internal helper returns the proxied client directly. Public callers
@@ -206,7 +235,7 @@ function createPolicyClientCore<
   };
 
   const runtime = {
-    options: options as CreatePolicyClientOptions<TContext, TSchema>,
+    options: options as CreateV0PolicyClientOptions<TContext, TSchema>,
     trace: options.trace,
     getContext: getPolicyContext,
     getDisabledPolicyNames: policyDisableScope.getDisabledPolicyNames,
@@ -317,6 +346,16 @@ function createPolicyClientCore<
         return helpers.withPoliciesDisabled;
       }
 
+      if (typeof prop === 'string' && UNSUPPORTED_SURFACES.has(prop)) {
+        // Refuse on call, not on read: a throwing property read would abort
+        // framework property enumeration at bootstrap.
+        return () => {
+          throw new DrizzlePolicyError(
+            `Drizzle Policy cannot enforce "${prop}"; it is not exposed by the policy client.`
+          );
+        };
+      }
+
       const value = Reflect.get(target, prop, receiver);
 
       if (prop === 'query' && assertMaybeObject(value)) {
@@ -327,7 +366,10 @@ function createPolicyClientCore<
         return (...args: readonly unknown[]) => {
           emitClientCall(runtime.trace, 'execute');
           enforceRawExecution(runtime, 'execute', args);
-          return Reflect.apply(value, target, args);
+          return wrapQueryErrors(
+            assertObject(Reflect.apply(value, target, args)),
+            runtime
+          );
         };
       }
 
@@ -359,9 +401,13 @@ function createPolicyClientCore<
         };
       }
 
-      if (prop === 'select' && typeof value === 'function') {
+      if (
+        typeof prop === 'string' &&
+        SELECT_METHODS.has(prop) &&
+        typeof value === 'function'
+      ) {
         return (...args: readonly unknown[]) => {
-          emitClientCall(runtime.trace, 'select');
+          emitClientCall(runtime.trace, prop);
           const builder = Reflect.apply(value, target, args);
           return wrapSelectBuilder(builder, runtime, tables);
         };
@@ -395,11 +441,17 @@ function createPolicyClientCore<
               plan.updateSet,
             ]);
 
-            return wrapWhereQuery(updateQuery, plan.predicates);
+            return wrapQueryErrors(
+              wrapWhereQuery(updateQuery, plan.predicates),
+              runtime
+            );
           }
 
           const builder = Reflect.apply(value, target, [table, ...args]);
-          return wrapWhereQuery(assertObject(builder), plan.predicates);
+          return wrapQueryErrors(
+            wrapWhereQuery(assertObject(builder), plan.predicates),
+            runtime
+          );
         };
       }
 
