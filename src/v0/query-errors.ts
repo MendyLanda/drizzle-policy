@@ -2,6 +2,17 @@ import type { MaybeSchema } from '../core/types.js';
 import type { PolicyRuntime } from './policy-runtime.js';
 
 /**
+ * Query methods whose synchronous or asynchronous failures are translated.
+ */
+const QUERY_EXECUTION_METHODS: ReadonlySet<string> = new Set([
+  'execute',
+  'run',
+  'all',
+  'get',
+  'values',
+]);
+
+/**
  * Translates a driver error raised by a policy-wrapped query; the returned
  * value is thrown in place of the original.
  */
@@ -72,10 +83,15 @@ const createErrorProxy = (
         };
       }
 
-      if (prop === 'execute') {
-        return async (...args: readonly unknown[]) => {
+      if (typeof prop === 'string' && QUERY_EXECUTION_METHODS.has(prop)) {
+        return (...args: readonly unknown[]) => {
           try {
-            return await Reflect.apply(value, target, args);
+            const result = Reflect.apply(value, target, args);
+            return isThenable(result)
+              ? Promise.resolve(result).catch(error => {
+                  throw onQueryError(error);
+                })
+              : result;
           } catch (error) {
             throw onQueryError(error);
           }

@@ -798,6 +798,106 @@ describe('drizzle-policy interface', () => {
     expect(directTransactionResultType).toBe(true);
   });
 
+  test('policy client types protect dialect and replica escape surfaces', () => {
+    type TypedRawClient = {
+      select(): 'select';
+      execute(): 'execute';
+      run(): 'run';
+      all(): 'all';
+      get(): 'get';
+      values(): 'values';
+      batch(): 'batch';
+      with(): 'with';
+      $client: object;
+      $cache: object;
+      _: object;
+      _query: object;
+      session: object;
+      dialect: object;
+      authToken: string;
+      tagged: object;
+    };
+    type TypedReplicaClient = TypedRawClient & {
+      $primary: TypedRawClient;
+      $replicas: TypedRawClient[];
+    };
+
+    const rawLeaf: TypedRawClient = {
+      select: () => 'select',
+      execute: () => 'execute',
+      run: () => 'run',
+      all: () => 'all',
+      get: () => 'get',
+      values: () => 'values',
+      batch: () => 'batch',
+      with: () => 'with',
+      $client: {},
+      $cache: {},
+      _: {},
+      _query: {},
+      session: {},
+      dialect: {},
+      authToken: 'secret',
+      tagged: {},
+    };
+    const rawDb: TypedReplicaClient = {
+      ...rawLeaf,
+      $primary: rawLeaf,
+      $replicas: [rawLeaf],
+    };
+    const { db } = createPolicyClient(rawDb, {
+      getContext: () => appContext,
+      policies: definePolicies<AppPolicyContext>()(() => []),
+    });
+
+    typeCheckOnly(() => {
+      // @ts-expect-error protected clients omit unsupported CTE builders
+      db.with();
+      // @ts-expect-error protected clients omit raw driver handles
+      void db.$client;
+      // @ts-expect-error protected clients omit internal metadata handles
+      void db._;
+      // @ts-expect-error protected clients omit raw sessions
+      void db.session;
+      // @ts-expect-error protected clients omit mutable dialects
+      void db.dialect;
+      // @ts-expect-error protected clients omit cache handles
+      void db.$cache;
+      // @ts-expect-error protected clients omit driver auth tokens
+      void db.authToken;
+      // @ts-expect-error protected clients omit raw tagged-SQL helpers
+      void db.tagged;
+      // @ts-expect-error protected clients omit internal query handles
+      void db._query;
+      // @ts-expect-error direct dialect execution is hidden
+      db.run();
+      // @ts-expect-error replica primary execution is hidden too
+      db.$primary.execute();
+      // @ts-expect-error individual replica execution is hidden too
+      db.$replicas[0]!.batch();
+      // @ts-expect-error wrapped replica collections are immutable
+      db.$replicas[0] = rawLeaf;
+
+      const primarySelect: () => 'select' = db.$primary.select;
+      const replicaSelect: () => 'select' = db.$replicas[0]!.select;
+      const unsafeDb = db.unsafe({ execute: true });
+      const unsafeRun: () => 'run' = unsafeDb.run;
+      const unsafePrimaryExecute: () => 'execute' = unsafeDb.$primary.execute;
+      const unsafeReplicaBatch: () => 'batch' = unsafeDb.$replicas[0]!.batch;
+
+      return [
+        primarySelect,
+        replicaSelect,
+        unsafeRun,
+        unsafePrimaryExecute,
+        unsafeReplicaBatch,
+      ];
+    });
+
+    expect(db.$primary).not.toBe(rawLeaf);
+    expect(db.$replicas[0]).not.toBe(rawLeaf);
+  });
+
   test('v0 subpath exposes the same interface for Drizzle v0 consumers', () => {
     const { db } = createV0TestEnvironment();
     const policies = definePolicies<AppPolicyContext, typeof v0Schema>()(() => [

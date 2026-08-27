@@ -42,6 +42,19 @@ export interface TableRegistry<TSchema extends MaybeSchema = MaybeSchema> {
    * carries the schema export key.
    */
   resolve(table: unknown, tableKeyHint?: string): ResolvedTable<TSchema>;
+  /**
+   * Records a derived query source whose underlying reads were checked by this
+   * policy client.
+   */
+  markProtectedSource(source: object, rebuild?: () => object): void;
+  /**
+   * Returns whether a derived query source was checked by this policy client.
+   */
+  isProtectedSource(source: unknown): boolean;
+  /**
+   * Rebuilds a protected derived source for the active policy state.
+   */
+  rebuildProtectedSource(source: unknown): object | undefined;
 }
 
 /**
@@ -57,6 +70,8 @@ export const createTableRegistry = <TSchema extends MaybeSchema>(
 ): TableRegistry<TSchema> => {
   const tablesByName = new Map<string, ResolvedTable<TSchema>>();
   const tablesByValue = new WeakMap<object, ResolvedTable<TSchema>>();
+  const protectedSources = new WeakSet<object>();
+  const protectedSourceRebuilders = new WeakMap<object, () => object>();
 
   if (queryRoot) {
     for (const [tableKey, builder] of Object.entries(queryRoot)) {
@@ -101,13 +116,35 @@ export const createTableRegistry = <TSchema extends MaybeSchema>(
         }
       }
 
-      const tableName = tryGetTableName(table) ?? tableKeyHint ?? 'unknown';
+      const tableName =
+        tryGetTableName(table) ??
+        tryGetSubqueryAlias(table) ??
+        tableKeyHint ??
+        'unknown';
 
       return {
         tableKey: (tableKeyHint ?? tableName) as TableKey<TSchema>,
         tableName,
         table: table as SchemaTable<TSchema>,
       };
+    },
+    markProtectedSource(source, rebuild) {
+      protectedSources.add(source);
+      if (rebuild) {
+        protectedSourceRebuilders.set(source, rebuild);
+      }
+    },
+    isProtectedSource(source) {
+      return (
+        typeof source === 'object' &&
+        source !== null &&
+        protectedSources.has(source)
+      );
+    },
+    rebuildProtectedSource(source) {
+      return typeof source === 'object' && source !== null
+        ? protectedSourceRebuilders.get(source)?.()
+        : undefined;
     },
   };
 };
@@ -145,6 +182,22 @@ const tryGetTableName = (value: unknown): string | undefined => {
   } catch {
     return undefined;
   }
+};
+
+/**
+ * Reads the alias carried by a Drizzle subquery selection proxy.
+ */
+const tryGetSubqueryAlias = (value: unknown): string | undefined => {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const metadata = value._;
+  return isRecord(metadata) &&
+    metadata.brand === 'Subquery' &&
+    typeof metadata.alias === 'string'
+    ? metadata.alias
+    : undefined;
 };
 
 /**

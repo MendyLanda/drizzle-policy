@@ -3,6 +3,7 @@ import {
   createPolicyDisableScope,
   normalizeUnsafePermissions,
 } from '../core/policy-disable.js';
+import { maskPropertyDescriptor } from '../core/query-surface.js';
 import type {
   CreatePolicyClientOptions,
   CreatePolicyClientResult,
@@ -15,12 +16,13 @@ import type {
   RawExecutionOption,
   UnsafePolicyInput,
 } from '../core/client.js';
-import type {
-  MaybeSchema,
-  PolicyContext,
-  PolicyNameInput,
-  PolicyNames,
-  PolicySet,
+import {
+  DrizzlePolicyError,
+  type MaybeSchema,
+  type PolicyContext,
+  type PolicyNameInput,
+  type PolicyNames,
+  type PolicySet,
 } from '../core/types.js';
 import {
   enforceRawExecution,
@@ -106,6 +108,52 @@ interface InternalV1PolicyClientOptions<
 }
 
 /**
+ * Query-producing and raw-handle surfaces the policy client cannot enforce.
+ */
+const UNSUPPORTED_SURFACES: ReadonlySet<string> = new Set([
+  'with',
+  '$with',
+  'refreshMaterializedView',
+  '$count',
+  '$client',
+  '$cache',
+  '_',
+  '_query',
+  'session',
+  'dialect',
+  'authToken',
+  'tagged',
+]);
+
+/**
+ * Direct execution methods exposed across Drizzle dialects.
+ */
+const RAW_EXECUTION_METHODS: ReadonlySet<string> = new Set([
+  'execute',
+  'run',
+  'all',
+  'get',
+  'values',
+  'batch',
+]);
+
+/**
+ * Client properties whose reflected values must retain policy wrapping.
+ */
+const PROTECTED_CLIENT_SURFACES: ReadonlySet<string> = new Set([
+  '$primary',
+  '$replicas',
+  'query',
+  'transaction',
+  'select',
+  'selectDistinct',
+  'selectDistinctOn',
+  'insert',
+  'update',
+  'delete',
+]);
+
+/**
  * Wraps a Drizzle v1 client so supported queries enforce policies.
  *
  * The returned object includes the wrapped Drizzle client and, unless an
@@ -114,7 +162,7 @@ interface InternalV1PolicyClientOptions<
  * Supported v1 surfaces include fluent select/insert/update/delete builders,
  * `db.query.*.findMany/findFirst` relational queries, nested relational
  * `with` entries when their table can be resolved, transactions, and direct
- * raw execution checks for `execute`.
+ * raw execution checks across supported Drizzle dialect methods.
  *
  * @example
  * ```ts
@@ -223,6 +271,40 @@ function createPolicyClientCore<
     PolicyNames<TPolicies>,
     RawExecutionAllowedByOptions<TOptions>
   >;
+  const relatedClients = new WeakMap<object, object>();
+  const replicaCollections = new WeakMap<object, readonly object[]>();
+
+  const wrapRelatedClient = (client: object): object => {
+    const cached = relatedClients.get(client);
+    if (cached) {
+      return cached;
+    }
+
+    const wrapped = createPolicyClientCore(client, {
+      ...runtime.options,
+      trace: runtime.trace,
+      getContext: getPolicyContext,
+      getDisabledPolicyNames: policyDisableScope.getDisabledPolicyNames,
+      isRawExecutionAllowed: policyDisableScope.isRawExecutionAllowed,
+    } as InternalV1PolicyClientOptions<TContext, TSchema, TPolicies>);
+    relatedClients.set(client, wrapped);
+    return wrapped;
+  };
+
+  const wrapReplicaCollection = (
+    replicas: readonly unknown[]
+  ): readonly object[] => {
+    const cached = replicaCollections.get(replicas);
+    if (cached) {
+      return cached;
+    }
+
+    const wrapped = Object.freeze(
+      replicas.map(replica => wrapRelatedClient(assertObject(replica)))
+    );
+    replicaCollections.set(replicas, wrapped);
+    return wrapped;
+  };
 
   const helpers: PolicyClientHelpers<
     TContext,
@@ -321,16 +403,36 @@ function createPolicyClientCore<
         return helpers.withPoliciesDisabled;
       }
 
+      if (typeof prop === 'string' && UNSUPPORTED_SURFACES.has(prop)) {
+        return () => {
+          throw new DrizzlePolicyError(
+            `Drizzle Policy cannot enforce "${prop}"; it is not exposed by the policy client.`
+          );
+        };
+      }
+
       const value = Reflect.get(target, prop, receiver);
+
+      if (prop === '$primary' && assertMaybeObject(value)) {
+        return wrapRelatedClient(value);
+      }
+
+      if (prop === '$replicas' && Array.isArray(value)) {
+        return wrapReplicaCollection(value);
+      }
 
       if (prop === 'query' && assertMaybeObject(value)) {
         return wrapRelationalQueryRoot(value, runtime, tables);
       }
 
-      if (prop === 'execute' && typeof value === 'function') {
+      if (
+        typeof prop === 'string' &&
+        RAW_EXECUTION_METHODS.has(prop) &&
+        typeof value === 'function'
+      ) {
         return (...args: readonly unknown[]) => {
-          emitClientCall(runtime.trace, 'execute');
-          enforceRawExecution(runtime, 'execute', args);
+          emitClientCall(runtime.trace, prop);
+          enforceRawExecution(runtime, prop, args);
           return Reflect.apply(value, target, args);
         };
       }
@@ -391,23 +493,58 @@ function createPolicyClientCore<
         return (table: unknown, ...args: readonly unknown[]) => {
           emitClientCall(runtime.trace, 'delete');
           const resolved = tables.resolve(table);
-          const plan = evaluateDeletePolicies(runtime, resolved);
+          const rebuild = () => {
+            const plan = evaluateDeletePolicies(runtime, resolved);
 
-          if (plan.updateSet) {
-            const updateBuilder = createUpdateBuilder(target, table);
-            const updateQuery = callBuilderMethod(updateBuilder, 'set', [
-              plan.updateSet,
-            ]);
+            if (plan.updateSet) {
+              const updateBuilder = createUpdateBuilder(target, table);
+              const query = callBuilderMethod(updateBuilder, 'set', [
+                plan.updateSet,
+              ]);
 
-            return wrapWhereQuery(updateQuery, plan.predicates);
-          }
+              return { query, predicates: plan.predicates };
+            }
 
-          const builder = Reflect.apply(value, target, [table, ...args]);
-          return wrapWhereQuery(assertObject(builder), plan.predicates);
+            const query = Reflect.apply(value, target, [table, ...args]);
+            return { query: assertObject(query), predicates: plan.predicates };
+          };
+
+          const initial = rebuild();
+          return wrapWhereQuery(initial.query, initial.predicates, {
+            rebuild,
+            rejectUpdateSources: true,
+          });
         };
       }
 
       return typeof value === 'function' ? value.bind(target) : value;
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+      return descriptor && isProtectedClientSurface(prop)
+        ? maskPropertyDescriptor(descriptor, Reflect.get(proxy, prop))
+        : descriptor;
+    },
+    set(target, prop, value, receiver) {
+      if (isProtectedClientSurface(prop)) {
+        return rejectClientSurfaceMutation(prop);
+      }
+
+      return Reflect.set(target, prop, value, receiver);
+    },
+    defineProperty(target, prop, attributes) {
+      if (isProtectedClientSurface(prop)) {
+        return rejectClientSurfaceMutation(prop);
+      }
+
+      return Reflect.defineProperty(target, prop, attributes);
+    },
+    deleteProperty(target, prop) {
+      if (isProtectedClientSurface(prop)) {
+        return rejectClientSurfaceMutation(prop);
+      }
+
+      return Reflect.deleteProperty(target, prop);
     },
   }) as PolicyClient<
     TClient,
@@ -418,6 +555,27 @@ function createPolicyClientCore<
 
   return proxy;
 }
+
+/**
+ * Returns whether reflection must expose the policy-wrapped client value.
+ */
+const isProtectedClientSurface = (prop: string | symbol): boolean => {
+  return (
+    typeof prop === 'string' &&
+    (UNSUPPORTED_SURFACES.has(prop) ||
+      RAW_EXECUTION_METHODS.has(prop) ||
+      PROTECTED_CLIENT_SURFACES.has(prop))
+  );
+};
+
+/**
+ * Rejects mutation of a client property whose wrapper enforces policy safety.
+ */
+const rejectClientSurfaceMutation = (prop: string | symbol): never => {
+  throw new DrizzlePolicyError(
+    `Drizzle Policy does not allow mutation of client surface "${String(prop)}".`
+  );
+};
 
 /**
  * Returns `db.query` when the Drizzle client exposes relational queries.
@@ -453,7 +611,11 @@ const emitClientCall = (
  * policy predicates after `.from(...)`.
  */
 const isSelectMethod = (prop: string | symbol): boolean => {
-  return prop === 'select' || prop === 'selectDistinct';
+  return (
+    prop === 'select' ||
+    prop === 'selectDistinct' ||
+    prop === 'selectDistinctOn'
+  );
 };
 
 /**

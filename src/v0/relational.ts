@@ -1,4 +1,9 @@
 import type { MaybeSchema, SchemaTable } from '../core/types.js';
+import {
+  maskPropertyDescriptor,
+  protectQuerySurface,
+  rejectQuerySurface,
+} from '../core/query-surface.js';
 import { combinePredicates } from './predicate.js';
 import { evaluateReadPolicies, type PolicyRuntime } from './policy-engine.js';
 import type { ResolvedTable, TableRegistry } from './table-registry.js';
@@ -26,7 +31,9 @@ export const wrapRelationalQueryRoot = <TContext, TSchema extends MaybeSchema>(
   runtime: PolicyRuntime<TContext, TSchema>,
   tables: TableRegistry<TSchema>
 ): object => {
-  return new Proxy(queryRoot, {
+  let proxy: object;
+
+  proxy = new Proxy(queryRoot, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
       if (!isObject(value) || typeof prop !== 'string') {
@@ -41,7 +48,24 @@ export const wrapRelationalQueryRoot = <TContext, TSchema extends MaybeSchema>(
         tables
       );
     },
+    getOwnPropertyDescriptor(target, prop) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+      return descriptor && isObject(descriptor.value)
+        ? maskPropertyDescriptor(descriptor, Reflect.get(proxy, prop))
+        : descriptor;
+    },
+    set(_target, prop) {
+      return rejectQuerySurface(String(prop));
+    },
+    defineProperty(_target, prop) {
+      return rejectQuerySurface(String(prop));
+    },
+    deleteProperty(_target, prop) {
+      return rejectQuerySurface(String(prop));
+    },
   });
+
+  return proxy;
 };
 
 /**
@@ -57,7 +81,7 @@ const wrapRelationalTableBuilder = <TContext, TSchema extends MaybeSchema>(
   runtime: PolicyRuntime<TContext, TSchema>,
   tables: TableRegistry<TSchema>
 ): object => {
-  return new Proxy(builder, {
+  const proxy = new Proxy(builder, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
 
@@ -71,20 +95,43 @@ const wrapRelationalTableBuilder = <TContext, TSchema extends MaybeSchema>(
       return (config?: unknown, ...args: readonly unknown[]) => {
         const table = getBuilderTable(target);
         const resolved = tables.resolve(table, tableKey);
-        const nextConfig = decorateRelationalConfig(
-          config,
-          resolved,
-          target,
-          queryRoot,
-          runtime,
-          tables
-        );
+        const createQuery = () => {
+          const nextConfig = decorateRelationalConfig(
+            config,
+            resolved,
+            target,
+            queryRoot,
+            runtime,
+            tables
+          );
 
-        const query = Reflect.apply(value, target, [nextConfig, ...args]);
-        return isObject(query) ? wrapQueryErrors(query, runtime) : query;
+          return Reflect.apply(value, target, [nextConfig, ...args]);
+        };
+        const query = createQuery();
+        if (!isObject(query)) {
+          return query;
+        }
+
+        const rebuild = () => {
+          const rebuilt = createQuery();
+          if (!isObject(rebuilt)) {
+            throw new Error(
+              'Expected Drizzle relational query to return an object.'
+            );
+          }
+
+          return rebuilt;
+        };
+
+        return wrapQueryErrors(
+          protectQuerySurface(query, { rebuild }),
+          runtime
+        );
       };
     },
   });
+
+  return protectQuerySurface(proxy);
 };
 
 /**

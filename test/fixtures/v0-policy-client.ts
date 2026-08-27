@@ -22,6 +22,7 @@ export type AppPolicyContext = {
 };
 
 export type SqlQuery = {
+  as(alias: string): unknown;
   toSQL(): {
     sql: string;
     params: unknown[];
@@ -87,6 +88,7 @@ export type ScopedV0DbOptions = {
 export interface ScopedV0Environment {
   readonly client: PGlite;
   readonly db: V0SqlClient;
+  readonly rawDb: V0SqlClient;
   readonly schema: typeof schema;
 }
 
@@ -148,6 +150,7 @@ export const createScopedV0Environment = (
 
   return {
     ...environment,
+    rawDb: environment.db as V0SqlClient,
     db: db as unknown as V0SqlClient,
   };
 };

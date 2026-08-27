@@ -124,8 +124,8 @@ With the policy above:
 - inserts into scoped tables get the current `tenantId`
 - inserts or updates for another tenant are rejected
 - tables without `tenantId` are left alone by this recipe
-- raw `execute` is hidden from the normal wrapped client unless you explicitly
-  enter an unsafe execute scope
+- direct raw execution methods are hidden from the normal wrapped client unless
+  you explicitly enter an unsafe execute scope
 
 ## Schema Shape
 
@@ -408,16 +408,17 @@ Recipe defaults:
 ### Raw Execution
 
 Raw execution APIs bypass table-aware planning, so Drizzle Policy rejects them
-by default. The wrapped TypeScript client also omits `execute` unless you
-explicitly allow raw execution for the client or enter an unsafe scope that
-grants it:
+by default. The wrapped TypeScript client also omits the dialect's direct
+execution methods unless you explicitly allow raw execution for the client or
+enter an unsafe scope that grants it. These methods include `execute`, SQLite's
+`run`/`all`/`get`/`values`, and driver `batch` APIs:
 
 ```ts
 const result = await db.unsafe({ execute: true }).execute(sql`select 1`);
 ```
 
-If you set `rawExecution: 'allow'`, `execute` is available on the normal client
-surface:
+If you set `rawExecution: 'allow'`, the dialect's raw methods are available on
+the normal client surface:
 
 ```ts
 const { db } = createPolicyClient(rawDb, {
@@ -428,7 +429,7 @@ const { db } = createPolicyClient(rawDb, {
 await db.execute(sql`select 1`);
 ```
 
-For legacy JavaScript, casts, or conditional access to `execute`, the
+For legacy JavaScript, casts, or conditional access to raw methods, the
 `rawExecution` callback remains a runtime fallback:
 
 ```ts
@@ -444,6 +445,18 @@ const { db } = createPolicyClient(rawDb, {
   },
 });
 ```
+
+### Prepared Queries
+
+Normal Drizzle query builders can still use `prepare()`. Policies are evaluated
+again whenever the prepared handle executes, so the same handle uses the active
+policy context and active `unsafe({ policies: [...] })` state for `execute()`,
+`run()`, `all()`, `get()`, or `values()` as supported by the dialect.
+
+For named PostgreSQL statements, the caller's name is retained for the first SQL
+shape. If policy state changes the SQL shape, Drizzle Policy derives a stable
+name for that additional shape. This preserves server-side reuse without asking
+PostgreSQL to associate one statement name with different SQL.
 
 You can still use Drizzle's `sql` template inside normal query builders and
 policy hooks.
@@ -501,12 +514,32 @@ Trace events are for debugging configuration, not for enforcing security.
 Both Drizzle versions currently cover:
 
 - SQL-like select, insert, update, and delete builders
+- aliased select subqueries created through the same policy client
 - joined tables in select builders
 - relational `db.query.*.findMany(...)` and `findFirst(...)`
 - nested relational `with` configs
 - transactions, with the transaction client wrapped in the same policies
-- raw `execute`, when granted through `unsafe({ execute: true })` or the
-  `rawExecution` runtime fallback
+- replica clients exposed through `$primary` and `$replicas`, wrapped with the
+  same policies
+- direct raw execution methods, when granted through
+  `unsafe({ execute: true })` or the `rawExecution` runtime fallback
+
+Query-producing surfaces that cannot yet be planned safely, such as top-level
+CTE builders and `$count`, are omitted. Raw driver/session handles such as
+`$client`, `_`, `session`, `dialect`, `$cache`, and driver auth/tagged-SQL handles
+are omitted too. Protected builders, queries, prepared queries, relational
+builders, and replica collections prevent replacement of their wrapped state.
+
+Some methods exist deeper in Drizzle's builder types but are rejected at runtime
+until Drizzle Policy can plan every table operation they contain:
+
+- select set operations (`union`, `intersect`, `except`, and variants)
+- insert-from-select
+- conflict updates (`onConflictDoUpdate` and `onDuplicateKeyUpdate`)
+- update-from and update joins, including updates produced by soft delete
+
+Use an explicitly granted raw execution scope only when the application has
+enforced the equivalent policies itself.
 
 ## Drizzle v0
 

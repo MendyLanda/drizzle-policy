@@ -19,6 +19,7 @@ export type AppPolicyContext = {
 };
 
 export type SqlQuery = {
+  as(alias: string): unknown;
   toSQL(): {
     sql: string;
     params: unknown[];
@@ -36,6 +37,9 @@ export type V1SqlClient = {
     from(table: unknown): SqlQuery & {
       innerJoin(table: unknown, on: unknown): SqlQuery;
     };
+  };
+  selectDistinctOn(columns: readonly unknown[]): {
+    from(table: unknown): SqlQuery;
   };
   insert(table: unknown): {
     values(values: unknown): SqlQuery;
@@ -75,6 +79,7 @@ export type ScopedV1DbOptions = {
 export interface ScopedV1Environment {
   readonly client: PGlite;
   readonly db: V1SqlClient;
+  readonly rawDb: V1SqlClient;
   readonly schema: typeof schema;
 }
 
@@ -134,6 +139,7 @@ export const createScopedV1Environment = (
 
   return {
     ...environment,
+    rawDb: environment.db as V1SqlClient,
     db: db as unknown as V1SqlClient,
   };
 };

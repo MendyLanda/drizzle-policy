@@ -1,4 +1,12 @@
 import type { MaybeSchema } from '../core/types.js';
+import {
+  createExecutionTimePrepareArgs,
+  createExecutionTimePreparedQuery,
+} from '../core/prepared-query.js';
+import {
+  protectQuerySurface,
+  rejectQuerySurface,
+} from '../core/query-surface.js';
 import { wrapQueryErrors } from './query-errors.js';
 import { combinePredicates } from './predicate.js';
 import {
@@ -20,7 +28,7 @@ export const wrapSelectBuilder = <TContext, TSchema extends MaybeSchema>(
   runtime: PolicyRuntime<TContext, TSchema>,
   tables: TableRegistry<TSchema>
 ): object => {
-  return new Proxy(builder, {
+  const proxy = new Proxy(builder, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
 
@@ -29,20 +37,36 @@ export const wrapSelectBuilder = <TContext, TSchema extends MaybeSchema>(
       }
 
       return (table: unknown, ...args: readonly unknown[]) => {
-        const query = Reflect.apply(value, target, [table, ...args]);
-        if (!isObject(query)) {
-          throw new Error(
-            'Expected Drizzle select.from() to return an object.'
-          );
-        }
+        const createQuery = (source: unknown) => {
+          const query = Reflect.apply(value, target, [source, ...args]);
+          if (!isObject(query)) {
+            throw new Error(
+              'Expected Drizzle select.from() to return an object.'
+            );
+          }
+
+          return query;
+        };
+        const rebuild = () => {
+          const source = tables.rebuildProtectedSource(table) ?? table;
+          return createQuery(source);
+        };
 
         return wrapQueryErrors(
-          wrapReadQuery(query, runtime, tables, tables.resolve(table)),
+          wrapReadQuery(
+            rebuild(),
+            runtime,
+            tables,
+            tables.resolve(table),
+            rebuild
+          ),
           runtime
         );
       };
     },
   });
+
+  return protectQuerySurface(proxy);
 };
 
 /**
@@ -56,27 +80,40 @@ export const wrapInsertBuilder = <TContext, TSchema extends MaybeSchema>(
   runtime: PolicyRuntime<TContext, TSchema>,
   table: ResolvedTable<TSchema>
 ): object => {
-  return new Proxy(builder, {
+  const proxy = new Proxy(builder, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
+
+      if (prop === 'select' && typeof value === 'function') {
+        return () => rejectQuerySurface('select');
+      }
 
       if (prop !== 'values' || typeof value !== 'function') {
         return value;
       }
 
       return (values: unknown, ...args: readonly unknown[]) => {
-        const plan = evaluateInsertPolicies(runtime, table, values);
-        const query = Reflect.apply(value, target, [plan.values, ...args]);
-        if (!isObject(query)) {
-          throw new Error(
-            'Expected Drizzle insert.values() to return an object.'
-          );
-        }
+        const rebuild = () => {
+          const plan = evaluateInsertPolicies(runtime, table, values);
+          const query = Reflect.apply(value, target, [plan.values, ...args]);
+          if (!isObject(query)) {
+            throw new Error(
+              'Expected Drizzle insert.values() to return an object.'
+            );
+          }
 
-        return wrapQueryErrors(query, runtime);
+          return query;
+        };
+
+        return wrapQueryErrors(
+          protectQuerySurface(rebuild(), { rebuild }),
+          runtime
+        );
       };
     },
   });
+
+  return protectQuerySurface(proxy);
 };
 
 /**
@@ -91,7 +128,7 @@ export const wrapUpdateBuilder = <TContext, TSchema extends MaybeSchema>(
   runtime: PolicyRuntime<TContext, TSchema>,
   table: ResolvedTable<TSchema>
 ): object => {
-  return new Proxy(builder, {
+  const proxy = new Proxy(builder, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
 
@@ -100,16 +137,31 @@ export const wrapUpdateBuilder = <TContext, TSchema extends MaybeSchema>(
       }
 
       return (set: unknown, ...args: readonly unknown[]) => {
-        const plan = evaluateUpdatePolicies(runtime, table, set);
-        const query = Reflect.apply(value, target, [plan.set, ...args]);
-        if (!isObject(query)) {
-          throw new Error('Expected Drizzle update.set() to return an object.');
-        }
+        const rebuild = (): RebuiltWhereQuery => {
+          const plan = evaluateUpdatePolicies(runtime, table, set);
+          const query = Reflect.apply(value, target, [plan.set, ...args]);
+          if (!isObject(query)) {
+            throw new Error(
+              'Expected Drizzle update.set() to return an object.'
+            );
+          }
 
-        return wrapQueryErrors(wrapWhereQuery(query, plan.predicates), runtime);
+          return { query, predicates: plan.predicates };
+        };
+
+        const initial = rebuild();
+        return wrapQueryErrors(
+          wrapWhereQuery(initial.query, initial.predicates, {
+            rebuild,
+            rejectUpdateSources: true,
+          }),
+          runtime
+        );
       };
     },
   });
+
+  return protectQuerySurface(proxy);
 };
 
 /**
@@ -123,30 +175,94 @@ const wrapReadQuery = <TContext, TSchema extends MaybeSchema>(
   query: object,
   runtime: PolicyRuntime<TContext, TSchema>,
   tables: TableRegistry<TSchema>,
-  table: ResolvedTable<TSchema>
+  table: ResolvedTable<TSchema>,
+  rebuildQuery?: () => object
 ): object => {
-  return wrapWhereQuery(
-    query,
-    () => {
-      return evaluateReadPolicies(runtime, table).predicates;
-    },
-    {
-      interceptCall(prop, target, args) {
-        if (!isJoinMethod(prop)) {
-          return undefined;
-        }
+  const sourceIsProtected = tables.isProtectedSource(table.table);
+  const crossJoinSources: unknown[] = [];
+  const resolvePredicates = () => {
+    const sourcePredicates = sourceIsProtected
+      ? []
+      : evaluateReadPolicies(runtime, table).predicates;
+    const crossJoinPredicates = crossJoinSources.flatMap(source => {
+      return tables.isProtectedSource(source)
+        ? []
+        : evaluateReadPolicies(runtime, tables.resolve(source)).predicates;
+    });
 
-        const [joinTable, joinOn, ...rest] = args;
-        const plan = evaluateReadPolicies(runtime, tables.resolve(joinTable));
-        const nextJoinOn = combinePredicates(...plan.predicates, joinOn);
+    return [...sourcePredicates, ...crossJoinPredicates];
+  };
+  const interceptCall = (
+    prop: string | symbol,
+    target: object,
+    args: readonly unknown[],
+    rebuildSources = false
+  ): { readonly handled: true; readonly result: unknown } | undefined => {
+    if (prop === 'as') {
+      const result = callMethod(target, prop, args);
+      if (!isObject(result)) {
+        throw new Error('Expected Drizzle select.as() to return an object.');
+      }
 
-        return {
-          handled: true,
-          result: callMethod(target, prop, [joinTable, nextJoinOn, ...rest]),
-        };
-      },
+      tables.markProtectedSource(result);
+      return { handled: true, result };
     }
-  );
+
+    if (isCrossJoinMethod(prop)) {
+      const [joinTable, ...rest] = args;
+      const nextJoinTable =
+        tables.rebuildProtectedSource(joinTable) ?? joinTable;
+      if (!rebuildSources) {
+        crossJoinSources.push(joinTable);
+      }
+
+      return {
+        handled: true,
+        result: callMethod(target, prop, [nextJoinTable, ...rest]),
+      };
+    }
+
+    if (!isJoinMethod(prop)) {
+      return undefined;
+    }
+
+    const [joinTable, joinOn, ...rest] = args;
+    const nextJoinTable = tables.rebuildProtectedSource(joinTable) ?? joinTable;
+    const predicates = tables.isProtectedSource(joinTable)
+      ? []
+      : evaluateReadPolicies(runtime, tables.resolve(nextJoinTable)).predicates;
+    const nextJoinOn = combinePredicates(...predicates, joinOn);
+
+    return {
+      handled: true,
+      result: callMethod(target, prop, [nextJoinTable, nextJoinOn, ...rest]),
+    };
+  };
+
+  return wrapWhereQuery(query, resolvePredicates, {
+    interceptCall,
+    rebuild: rebuildQuery
+      ? () => ({
+          query: rebuildQuery(),
+          predicates: resolvePredicates(),
+        })
+      : undefined,
+    replayRebuilt: rebuildQuery
+      ? (target, prop, args) => {
+          const intercepted = interceptCall(prop, target, args, true);
+          return intercepted?.handled
+            ? intercepted.result
+            : callMethod(target, prop, args);
+        }
+      : undefined,
+    onDerivedQuery: rebuildQuery
+      ? (source, prop, rebuild) => {
+          if (prop === 'as') {
+            tables.markProtectedSource(source, rebuild);
+          }
+        }
+      : undefined,
+  });
 };
 
 /**
@@ -157,6 +273,30 @@ const wrapReadQuery = <TContext, TSchema extends MaybeSchema>(
  */
 interface WhereQueryOptions {
   /**
+   * Rejects update-from and update-join methods until their reads are planned.
+   */
+  readonly rejectUpdateSources?: boolean;
+  /**
+   * Rebuilds a write query and its predicates for a prepared execution.
+   */
+  readonly rebuild?: () => RebuiltWhereQuery;
+  /**
+   * Replays a fluent call whose arguments require execution-time policies.
+   */
+  readonly replayRebuilt?: (
+    query: object,
+    prop: string | symbol,
+    args: readonly unknown[]
+  ) => unknown;
+  /**
+   * Records a derived source and its execution-time rebuild recipe.
+   */
+  readonly onDerivedQuery?: (
+    query: object,
+    prop: string | symbol,
+    rebuild: () => object
+  ) => void;
+  /**
    * Optional handler for query methods that need policy predicates before the
    * original method runs.
    */
@@ -165,6 +305,16 @@ interface WhereQueryOptions {
     target: object,
     args: readonly unknown[]
   ) => { readonly handled: true; readonly result: unknown } | undefined;
+}
+
+/**
+ * Fresh write query and the policy predicates produced for the same context.
+ */
+interface RebuiltWhereQuery {
+  /** Query rebuilt from the write builder. */
+  readonly query: object;
+  /** Policy predicates evaluated with the same runtime state. */
+  readonly predicates: readonly unknown[];
 }
 
 /**
@@ -180,17 +330,33 @@ export const wrapWhereQuery = (
   options: WhereQueryOptions = {}
 ): object => {
   let applied = false;
+  let hasUserWhere = false;
+  let userWhere: unknown;
   let proxy: object;
+
+  const resolvePredicates = () => {
+    return typeof predicates === 'function' ? predicates() : predicates;
+  };
+
+  const resolveUserWhere = (config: Record<string, unknown>): unknown => {
+    if (!hasUserWhere) {
+      userWhere = config.where;
+      hasUserWhere = true;
+    }
+
+    return userWhere;
+  };
 
   const applyPolicies = () => {
     if (applied) {
       return;
     }
 
-    const nextPredicates =
-      typeof predicates === 'function' ? predicates() : predicates;
     const config = getConfig(query);
-    config.where = combinePredicates(...nextPredicates, config.where);
+    config.where = combinePredicates(
+      ...resolvePredicates(),
+      resolveUserWhere(config)
+    );
     applied = true;
   };
 
@@ -207,6 +373,44 @@ export const wrapWhereQuery = (
       }
 
       return (...args: readonly unknown[]) => {
+        if (options.rejectUpdateSources) {
+          rejectUnsupportedUpdateCall(prop);
+        }
+
+        if (prop === 'prepare' || prop === '_prepare') {
+          const resolvePrepareArgs = createExecutionTimePrepareArgs();
+          const prepareForExecution = () => {
+            const config = getConfig(query);
+            const previousWhere = config.where;
+            config.where = combinePredicates(
+              ...resolvePredicates(),
+              resolveUserWhere(config)
+            );
+
+            try {
+              const prepared = Reflect.apply(
+                value,
+                target,
+                resolvePrepareArgs(query, args)
+              );
+              if (!isObject(prepared)) {
+                throw new Error(
+                  'Expected Drizzle prepare() to return an object.'
+                );
+              }
+
+              return prepared;
+            } finally {
+              config.where = previousWhere;
+            }
+          };
+
+          return createExecutionTimePreparedQuery(
+            prepareForExecution(),
+            prepareForExecution
+          );
+        }
+
         const intercepted = options.interceptCall?.(prop, target, args);
         if (intercepted?.handled) {
           return intercepted.result === target ? proxy : intercepted.result;
@@ -217,6 +421,9 @@ export const wrapWhereQuery = (
           // .where() assigns rather than accumulates, discarding an applied
           // policy predicate — re-arm so it is recombined.
           applied = false;
+          const config = getConfig(query);
+          userWhere = config.where;
+          hasUserWhere = true;
         }
 
         return result === target ? proxy : result;
@@ -224,7 +431,26 @@ export const wrapWhereQuery = (
     },
   });
 
-  return proxy;
+  let rebuiltPredicates: readonly unknown[] = [];
+  const rebuild = options.rebuild
+    ? () => {
+        const rebuilt = options.rebuild!();
+        rebuiltPredicates = rebuilt.predicates;
+        return rebuilt.query;
+      }
+    : undefined;
+
+  return protectQuerySurface(proxy, {
+    rebuild,
+    finalizeRebuilt: rebuild
+      ? rebuilt => {
+          const config = getConfig(rebuilt);
+          config.where = combinePredicates(...rebuiltPredicates, config.where);
+        }
+      : undefined,
+    replayRebuilt: options.replayRebuilt,
+    onDerivedQuery: options.onDerivedQuery,
+  });
 };
 
 /**
@@ -235,11 +461,14 @@ const shouldApplyBefore = (prop: string | symbol): boolean => {
     prop === 'toSQL' ||
     prop === 'getSQL' ||
     prop === 'execute' ||
+    prop === 'all' ||
+    prop === 'get' ||
+    prop === 'values' ||
+    prop === 'run' ||
     prop === 'then' ||
     prop === 'catch' ||
     prop === 'finally' ||
-    prop === 'prepare' ||
-    prop === '_prepare'
+    prop === 'as'
   );
 };
 
@@ -249,10 +478,30 @@ const shouldApplyBefore = (prop: string | symbol): boolean => {
 const isJoinMethod = (prop: string | symbol): boolean => {
   return (
     prop === 'leftJoin' ||
+    prop === 'leftJoinLateral' ||
     prop === 'rightJoin' ||
     prop === 'innerJoin' ||
+    prop === 'innerJoinLateral' ||
     prop === 'fullJoin'
   );
+};
+
+/**
+ * Returns whether a builder method adds a cross-joined source.
+ */
+const isCrossJoinMethod = (prop: string | symbol): boolean => {
+  return prop === 'crossJoin' || prop === 'crossJoinLateral';
+};
+
+/**
+ * Rejects update sources whose read policies cannot yet be planned safely.
+ */
+const rejectUnsupportedUpdateCall = (prop: string | symbol): undefined => {
+  if (prop === 'from' || isJoinMethod(prop) || isCrossJoinMethod(prop)) {
+    rejectQuerySurface(String(prop));
+  }
+
+  return undefined;
 };
 
 /**

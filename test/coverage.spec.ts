@@ -12,6 +12,11 @@ import {
   normalizeUnsafePermissions,
 } from '../src/core/policy-disable';
 import {
+  createExecutionTimePrepareArgs,
+  createExecutionTimePreparedQuery,
+} from '../src/core/prepared-query';
+import { protectQuerySurface } from '../src/core/query-surface';
+import {
   DrizzlePolicyError,
   MissingPolicyContextError,
 } from '../src/core/types';
@@ -214,6 +219,138 @@ describe('coverage-focused core helpers', () => {
     isolatedScope.withPoliciesDisabled(['legacy'], client, () => {
       expect([...isolatedScope.getDisabledPolicyNames()]).toEqual(['legacy']);
     });
+  });
+
+  test('protects prepared queries and rejects query-object mutation', () => {
+    const prepared = {
+      executor: { name: 'raw-driver' },
+      execute: () => 'executed',
+    };
+    const query = {
+      label: 'query',
+      chain() {
+        return query;
+      },
+      prepare: () => prepared,
+    };
+    const protectedQuery = protectQuerySurface(query) as any;
+
+    expect(protectedQuery.label).toBe('query');
+    expect(protectedQuery.chain()).toBe(protectedQuery);
+    expect(protectedQuery.prepare().execute()).toBe('executed');
+    expect(() => protectedQuery.prepare().executor()).toThrow(
+      'Drizzle Policy does not expose query surface "executor".'
+    );
+
+    expect(() => Reflect.set(protectedQuery, 'label', 'updated')).toThrow(
+      DrizzlePolicyError
+    );
+    expect(protectedQuery.label).toBe('query');
+    expect(() =>
+      Reflect.defineProperty(protectedQuery, 'description', {
+        configurable: true,
+        value: 'protected query',
+      })
+    ).toThrow(DrizzlePolicyError);
+    expect(() => Reflect.deleteProperty(protectedQuery, 'description')).toThrow(
+      DrizzlePolicyError
+    );
+  });
+
+  test('reports invalid execution-time prepared query shapes', () => {
+    const prepared = createExecutionTimePreparedQuery(
+      {
+        label: 'prepared',
+        execute: () => 'initial',
+      },
+      () => ({})
+    );
+
+    expect(prepared.label).toBe('prepared');
+    expect(() => prepared.execute()).toThrow(
+      'Prepared query does not expose execute().'
+    );
+  });
+
+  test('disambiguates colliding prepared statement shape hashes', () => {
+    const resolvePrepareArgs = createExecutionTimePrepareArgs();
+    const query = (sql: string) => ({
+      toSQL: () => ({ sql }),
+    });
+
+    expect(resolvePrepareArgs(query('initial'), ['statement'])).toEqual([
+      'statement',
+    ]);
+    expect(resolvePrepareArgs(query('shape-9758'), ['statement'])).toEqual([
+      'statement__drizzle_policy_18l16ww',
+    ]);
+    expect(resolvePrepareArgs(query('shape-47484'), ['statement'])).toEqual([
+      'statement__drizzle_policy_18l16ww_2',
+    ]);
+    expect(resolvePrepareArgs({}, ['unknown-shape'])).toEqual([
+      'unknown-shape__drizzle_policy_mtwmjv',
+    ]);
+  });
+
+  test('reports invalid rebuilt query shapes', () => {
+    const initialPrepared = {
+      execute: () => 'initial',
+    };
+    const query = {
+      chain() {
+        return query;
+      },
+      prepare: () => initialPrepared,
+    };
+
+    expect(() =>
+      (
+        protectQuerySurface(query, {
+          rebuild: () => ({}),
+        }) as any
+      ).prepare()
+    ).toThrow('Rebuilt query does not expose prepare().');
+
+    expect(() =>
+      (
+        protectQuerySurface(query, {
+          rebuild: () => ({
+            prepare: () => null,
+          }),
+        }) as any
+      ).prepare()
+    ).toThrow('Expected Drizzle prepare() to return an object.');
+
+    const missingFluent = protectQuerySurface(query, {
+      rebuild: () => ({
+        prepare: () => initialPrepared,
+      }),
+    }) as any;
+
+    missingFluent.chain();
+    expect(() => missingFluent.prepare()).toThrow(
+      'Rebuilt query does not expose chain().'
+    );
+
+    let rebuildDerived: (() => object) | undefined;
+    const derived = protectQuerySurface(
+      {
+        derive: () => ({}),
+      },
+      {
+        rebuild: () => ({
+          derive: () => null,
+        }),
+        onDerivedQuery: (_query, _prop, rebuild) => {
+          rebuildDerived = rebuild;
+        },
+      }
+    ) as any;
+
+    derived.derive();
+    expect(() => rebuildDerived?.()).toThrow(
+      'Expected rebuilt derive() to return an object.'
+    );
   });
 });
 
@@ -1033,12 +1170,28 @@ const sqlBuilderStacks = [
 
 for (const { name, builders } of sqlBuilderStacks) {
   describe(`${name} SQL builder wrapper coverage`, () => {
+    const protectedSources = new WeakSet<object>();
+    const protectedSourceRebuilders = new WeakMap<object, () => object>();
     const tables = {
       resolve: (table: unknown, tableKeyHint?: string) => ({
         tableKey: tableKeyHint ?? 'projects',
         tableName: tableKeyHint ?? 'projects',
         table,
       }),
+      markProtectedSource: (source: object, rebuild?: () => object) => {
+        protectedSources.add(source);
+        if (rebuild) {
+          protectedSourceRebuilders.set(source, rebuild);
+        }
+      },
+      isProtectedSource: (source: unknown) =>
+        typeof source === 'object' &&
+        source !== null &&
+        protectedSources.has(source),
+      rebuildProtectedSource: (source: unknown) =>
+        typeof source === 'object' && source !== null
+          ? protectedSourceRebuilders.get(source)?.()
+          : undefined,
     } as any;
 
     test('returns untouched properties and rejects unexpected builder shapes', () => {
@@ -1099,6 +1252,36 @@ for (const { name, builders } of sqlBuilderStacks) {
           ) as any
         ).set({})
       ).toThrow('Expected Drizzle update.set() to return an object.');
+
+      expect(() =>
+        (
+          builders.wrapInsertBuilder(
+            {
+              values: () => null,
+            },
+            createRuntime([]),
+            projectTable as any
+          ) as any
+        ).values({})
+      ).toThrow('Expected Drizzle insert.values() to return an object.');
+
+      const invalidAliasQuery = {
+        config: {},
+        as: () => null,
+      };
+      const invalidAlias = (
+        builders.wrapSelectBuilder(
+          {
+            from: () => invalidAliasQuery,
+          },
+          createRuntime([]),
+          tables
+        ) as any
+      ).from(v1Schema.projects);
+
+      expect(() => invalidAlias.as('invalid')).toThrow(
+        'Expected Drizzle select.as() to return an object.'
+      );
     });
 
     test('applies where predicates once and preserves fluent query methods', () => {
@@ -1134,6 +1317,30 @@ for (const { name, builders } of sqlBuilderStacks) {
       expect(() => (builders.wrapWhereQuery({}, []) as any).toSQL).toThrow(
         'Unable to inspect Drizzle query builder config.'
       );
+
+      const invalidPrepared = builders.wrapWhereQuery(
+        {
+          config: {},
+          prepare: () => null,
+        },
+        []
+      ) as any;
+
+      expect(() => invalidPrepared.prepare()).toThrow(
+        'Expected Drizzle prepare() to return an object.'
+      );
+
+      const validPrepared = builders.wrapWhereQuery(
+        {
+          config: {},
+          prepare: () => ({
+            execute: () => 'prepared',
+          }),
+        },
+        []
+      ) as any;
+
+      expect(validPrepared.prepare().execute()).toBe('prepared');
     });
 
     test('handles intercepted join calls and missing join methods', () => {
@@ -1182,6 +1389,30 @@ for (const { name, builders } of sqlBuilderStacks) {
       expect(() => innerJoin(v1Schema.tasks, undefined)).toThrow(
         'Expected Drizzle builder method innerJoin().'
       );
+
+      const replayQuery = {
+        config: {},
+        where() {
+          return replayQuery;
+        },
+        prepare() {
+          return {
+            execute: () => 'prepared',
+          };
+        },
+      };
+      const replayed = (
+        builders.wrapSelectBuilder(
+          {
+            from: () => replayQuery,
+          },
+          createRuntime([]),
+          tables
+        ) as any
+      ).from(v1Schema.projects);
+
+      replayed.where('user-filter');
+      expect(replayed.prepare().execute()).toBe('prepared');
     });
   });
 }
@@ -1271,6 +1502,48 @@ describe('coverage-focused relational wrappers', () => {
     expect(capturedNoRelationsConfig.with).toEqual({
       tasks: true,
     });
+
+    const primitiveWrapped = v0Relational.wrapRelationalQueryRoot(
+      {
+        projects: {
+          table: v0Schema.projects,
+          findMany: () => 'primitive-query',
+        },
+      },
+      createRuntime([]),
+      createV0TableRegistry({
+        projects: {
+          table: v0Schema.projects,
+        },
+      })
+    ) as any;
+
+    expect(primitiveWrapped.projects.findMany()).toBe('primitive-query');
+
+    let rebuildCalls = 0;
+    const unstableWrapped = v0Relational.wrapRelationalQueryRoot(
+      {
+        projects: {
+          table: v0Schema.projects,
+          findMany() {
+            rebuildCalls += 1;
+            return rebuildCalls === 1
+              ? { prepare: () => ({ execute: () => undefined }) }
+              : null;
+          },
+        },
+      },
+      createRuntime([]),
+      createV0TableRegistry({
+        projects: {
+          table: v0Schema.projects,
+        },
+      })
+    ) as any;
+
+    expect(() => unstableWrapped.projects.findMany().prepare()).toThrow(
+      'Expected Drizzle relational query to return an object.'
+    );
   });
 
   test('v1 relational wrapper preserves non-query members and unresolved nested relations', () => {
@@ -1358,6 +1631,48 @@ describe('coverage-focused relational wrappers', () => {
     expect(capturedNoRelationsConfig.with).toEqual({
       tasks: true,
     });
+
+    const primitiveWrapped = v1Relational.wrapRelationalQueryRoot(
+      {
+        projects: {
+          table: v1Schema.projects,
+          findMany: () => 'primitive-query',
+        },
+      },
+      createRuntime([]),
+      createV1TableRegistry({
+        projects: {
+          table: v1Schema.projects,
+        },
+      })
+    ) as any;
+
+    expect(primitiveWrapped.projects.findMany()).toBe('primitive-query');
+
+    let rebuildCalls = 0;
+    const unstableWrapped = v1Relational.wrapRelationalQueryRoot(
+      {
+        projects: {
+          table: v1Schema.projects,
+          findMany() {
+            rebuildCalls += 1;
+            return rebuildCalls === 1
+              ? { prepare: () => ({ execute: () => undefined }) }
+              : null;
+          },
+        },
+      },
+      createRuntime([]),
+      createV1TableRegistry({
+        projects: {
+          table: v1Schema.projects,
+        },
+      })
+    ) as any;
+
+    expect(() => unstableWrapped.projects.findMany().prepare()).toThrow(
+      'Expected Drizzle relational query to return an object.'
+    );
   });
 });
 

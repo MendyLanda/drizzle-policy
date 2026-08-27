@@ -77,8 +77,8 @@ export interface RawExecutionArgs<TContext> {
   /**
    * Raw execution method being called.
    *
-   * Today Drizzle Policy checks `execute` on wrapped clients and transaction
-   * clients.
+   * Drizzle Policy checks `execute`, SQLite-style `run`/`all`/`get`/`values`,
+   * and driver `batch` methods on wrapped clients and transaction clients.
    */
   readonly method: string;
   /**
@@ -413,7 +413,7 @@ export type UnsafePolicyInput<TPolicyName extends string = string> =
  * Unsafe permission object that explicitly grants raw execution.
  *
  * This overload helper lets `db.unsafe({ execute: true })` return a client type
- * where `execute` is visible.
+ * where the wrapped dialect's raw execution methods are visible.
  */
 type UnsafeExecutePermissions<TPolicyName extends string> =
   UnsafePolicyPermissions<TPolicyName> & {
@@ -423,9 +423,51 @@ type UnsafeExecutePermissions<TPolicyName extends string> =
 /**
  * Raw execution method keys copied back into unsafe execute scopes.
  *
- * Currently Drizzle Policy treats `execute` as the direct raw execution surface.
+ * This includes the direct execution methods exposed across Drizzle dialects.
  */
-type RawExecutionKey<TClient> = Extract<keyof TClient, 'execute'>;
+type RawExecutionKey<TClient> = Extract<
+  keyof TClient,
+  'execute' | 'run' | 'all' | 'get' | 'values' | 'batch'
+>;
+
+/**
+ * Client properties that expose raw handles or unsupported query builders.
+ */
+type UnsupportedPolicyClientKey<TClient> = Extract<
+  keyof TClient,
+  | 'with'
+  | '$with'
+  | 'refreshMaterializedView'
+  | '$count'
+  | '$client'
+  | '$cache'
+  | '_'
+  | '_query'
+  | 'session'
+  | 'dialect'
+  | 'authToken'
+  | 'tagged'
+>;
+
+/**
+ * Protects one raw client exposed by a replica-aware Drizzle client.
+ */
+type PolicyRelatedClient<
+  TValue,
+  TAllowRawExecution extends boolean,
+> = TValue extends object
+  ? PolicyClientSurface<TValue, TAllowRawExecution>
+  : TValue;
+
+/**
+ * Protects every client in a replica collection and prevents raw replacement.
+ */
+type PolicyReplicaClients<
+  TValue,
+  TAllowRawExecution extends boolean,
+> = TValue extends readonly (infer TReplica)[]
+  ? readonly PolicyRelatedClient<TReplica, TAllowRawExecution>[]
+  : TValue;
 
 /**
  * Drizzle client surface after removing or restoring raw execution methods.
@@ -437,9 +479,13 @@ type PolicyClientSurface<TClient, TAllowRawExecution extends boolean> = Omit<
   {
     [TKey in keyof TClient]: TKey extends 'transaction'
       ? PolicyTransactionMethod<TClient[TKey], TAllowRawExecution>
-      : TClient[TKey];
+      : TKey extends '$primary'
+        ? PolicyRelatedClient<TClient[TKey], TAllowRawExecution>
+        : TKey extends '$replicas'
+          ? PolicyReplicaClients<TClient[TKey], TAllowRawExecution>
+          : TClient[TKey];
   },
-  'execute'
+  RawExecutionKey<TClient> | UnsupportedPolicyClientKey<TClient>
 > &
   (TAllowRawExecution extends true
     ? Pick<TClient, RawExecutionKey<TClient>>
